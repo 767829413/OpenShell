@@ -84,6 +84,11 @@ impl Drop for EnvVarGuard {
 #[derive(Clone, Default)]
 struct SandboxState {
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
+    /// Inbound `CreateSandboxRequest`s recorded in arrival order. Tests
+    /// that need to assert on what the CLI actually sent over the wire
+    /// (e.g. that user-supplied --port-binding / --bind-mount flags are
+    /// faithfully populated on `template`) read from this.
+    create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
 }
 
 #[derive(Clone, Default)]
@@ -107,7 +112,11 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        let name = request.into_inner().name;
+        let inner = request.into_inner();
+        // Snapshot the request before consuming `name` below so tests
+        // can inspect template fields without re-cloning at every call site.
+        self.state.create_requests.lock().await.push(inner.clone());
+        let name = inner.name;
         let sandbox_name = if name.is_empty() {
             "test-sandbox".to_string()
         } else {
@@ -648,6 +657,16 @@ async fn deleted_names(server: &TestServer) -> Vec<Vec<String>> {
     server.openshell.state.deleted_names.lock().await.clone()
 }
 
+async fn create_requests(server: &TestServer) -> Vec<CreateSandboxRequest> {
+    server
+        .openshell
+        .state
+        .create_requests
+        .lock()
+        .await
+        .clone()
+}
+
 fn test_tls(server: &TestServer) -> TlsOptions {
     server.tls.with_gateway_name("openshell")
 }
@@ -678,6 +697,8 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         Some(false),
         Some(false),
         &HashMap::new(),
+        &[],
+        &[],
         &tls,
     )
     .await
@@ -717,6 +738,8 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         Some(false),
         Some(false),
         &HashMap::new(),
+        &[],
+        &[],
         &tls,
     )
     .await
@@ -759,6 +782,8 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         Some(true),
         Some(false),
         &HashMap::new(),
+        &[],
+        &[],
         &tls,
     )
     .await
@@ -801,6 +826,8 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         Some(false),
         Some(false),
         &HashMap::new(),
+        &[],
+        &[],
         &tls,
     )
     .await
@@ -843,10 +870,84 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         Some(false),
         Some(false),
         &HashMap::new(),
+        &[],
+        &[],
         &tls,
     )
     .await
     .expect("sandbox create with forward should succeed");
 
     assert!(deleted_names(&server).await.is_empty());
+}
+
+/// Regression: confirm that user-supplied `--port-binding` and
+/// `--bind-mount` flags travel end-to-end into the `CreateSandboxRequest`
+/// the gateway receives.  The previous integration tests only passed
+/// `&[]` placeholders, so the wiring inside `run::sandbox_create` (which
+/// copies the slices into `SandboxTemplate.{port_bindings, bind_mounts}`)
+/// had no actual e2e coverage.  Without this test, removing those two
+/// `.to_vec()` calls would not fail CI.
+#[tokio::test]
+async fn sandbox_create_forwards_port_bindings_and_bind_mounts_to_gateway() {
+    use openshell_core::proto::{BindMount, PortBinding};
+
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    let pbs = [PortBinding {
+        container_port: 8000,
+        host_port: 18000,
+    }];
+    let bms = [BindMount {
+        host_path: "/var/sandbox-data".to_string(),
+        container_path: "/workspace".to_string(),
+        read_only: Some(false),
+    }];
+
+    // `from = Some(...)` is required: `run::sandbox_create` only populates
+    // `SandboxSpec.template` when an image source was specified.  Without
+    // an image, port_bindings/bind_mounts have nowhere to live and the
+    // CLI silently drops them — this is the existing intentional design.
+    run::sandbox_create(
+        &server.endpoint,
+        Some("with-bindings"),
+        Some("ghcr.io/example/img:test"),
+        "openshell",
+        None,
+        true,
+        false,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &["echo".to_string(), "OK".to_string()],
+        Some(false),
+        Some(false),
+        &HashMap::new(),
+        &pbs,
+        &bms,
+        &tls,
+    )
+    .await
+    .expect("sandbox create with port/bind flags should succeed");
+
+    let reqs = create_requests(&server).await;
+    assert_eq!(reqs.len(), 1, "expected exactly one CreateSandboxRequest");
+    let tmpl = reqs[0]
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.as_ref())
+        .expect("CreateSandboxRequest.spec.template should be populated when flags are passed");
+    assert_eq!(tmpl.port_bindings.len(), 1, "port_bindings: {:?}", tmpl.port_bindings);
+    assert_eq!(tmpl.port_bindings[0].host_port, 18000);
+    assert_eq!(tmpl.port_bindings[0].container_port, 8000);
+    assert_eq!(tmpl.bind_mounts.len(), 1, "bind_mounts: {:?}", tmpl.bind_mounts);
+    assert_eq!(tmpl.bind_mounts[0].host_path, "/var/sandbox-data");
+    assert_eq!(tmpl.bind_mounts[0].container_path, "/workspace");
+    assert_eq!(tmpl.bind_mounts[0].read_only, Some(false));
 }

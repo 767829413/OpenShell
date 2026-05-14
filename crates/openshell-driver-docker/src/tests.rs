@@ -4,7 +4,8 @@
 use super::*;
 use openshell_core::config::{CDI_GPU_DEVICE_ALL, DEFAULT_SERVER_PORT};
 use openshell_core::proto::compute::v1::{
-    DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
+    BindMount, DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
+    PortBinding as ProtoPortBinding,
 };
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -30,6 +31,8 @@ fn test_sandbox() -> DriverSandbox {
                 environment: HashMap::from([("TEMPLATE_ENV".to_string(), "template".to_string())]),
                 resources: None,
                 platform_config: None,
+                port_bindings: Vec::new(),
+                bind_mounts: Vec::new(),
             }),
             gpu: false,
             gpu_device: String::new(),
@@ -63,6 +66,9 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         }),
         daemon_version: "28.0.0".to_string(),
         supports_gpu: false,
+        port_binding_allowed_range: None,
+        bind_mount_allowed_path_templates: Vec::new(),
+        bind_mount_extra_denied_paths: Vec::new(),
     }
 }
 
@@ -359,6 +365,8 @@ fn docker_resource_limits_rejects_requests() {
             memory_limit: String::new(),
         }),
         platform_config: None,
+        port_bindings: Vec::new(),
+        bind_mounts: Vec::new(),
     };
 
     let err = docker_resource_limits(&template).unwrap_err();
@@ -970,4 +978,696 @@ fn container_state_needs_resume_matches_startable_states() {
             "{state:?} should not be resumed with Docker start",
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// port_bindings / bind_mounts enforcement (M2 of docs/plans/doing/
+// openshell-fork-native-isolation.md). The driver is the trust boundary;
+// these tests pin the user-facing contract.
+// ---------------------------------------------------------------------------
+
+fn port_template(bindings: Vec<ProtoPortBinding>) -> DriverSandboxTemplate {
+    DriverSandboxTemplate {
+        image: "img".to_string(),
+        agent_socket_path: String::new(),
+        labels: HashMap::new(),
+        environment: HashMap::new(),
+        resources: None,
+        platform_config: None,
+        port_bindings: bindings,
+        bind_mounts: Vec::new(),
+    }
+}
+
+fn mount_template(mounts: Vec<BindMount>) -> DriverSandboxTemplate {
+    DriverSandboxTemplate {
+        image: "img".to_string(),
+        agent_socket_path: String::new(),
+        labels: HashMap::new(),
+        environment: HashMap::new(),
+        resources: None,
+        platform_config: None,
+        port_bindings: Vec::new(),
+        bind_mounts: mounts,
+    }
+}
+
+#[test]
+fn port_bindings_empty_request_returns_none() {
+    let template = port_template(Vec::new());
+    let cfg = runtime_config();
+    let result = enforce_and_build_port_bindings(&template, &cfg).unwrap();
+    assert!(
+        result.is_none(),
+        "absent port_bindings must not set HostConfig.port_bindings"
+    );
+}
+
+#[test]
+fn port_bindings_rejected_when_driver_has_no_allowed_range() {
+    let template = port_template(vec![ProtoPortBinding {
+        container_port: 8765,
+        host_port: 18765,
+    }]);
+    let cfg = runtime_config();
+    let err = enforce_and_build_port_bindings(&template, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("disabled"), "msg: {}", err.message());
+}
+
+#[test]
+fn port_bindings_in_range_produce_loopback_mapping() {
+    let template = port_template(vec![ProtoPortBinding {
+        container_port: 8765,
+        host_port: 18765,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.port_binding_allowed_range = Some((18000, 19999));
+    let map = enforce_and_build_port_bindings(&template, &cfg)
+        .unwrap()
+        .expect("port_bindings should be Some");
+    let entries = map
+        .get("8765/tcp")
+        .expect("map key uses <port>/tcp form")
+        .as_ref()
+        .expect("binding list must be present");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].host_ip.as_deref(), Some("127.0.0.1"));
+    assert_eq!(entries[0].host_port.as_deref(), Some("18765"));
+}
+
+#[test]
+fn port_bindings_host_port_outside_range_rejected() {
+    let template = port_template(vec![ProtoPortBinding {
+        container_port: 8765,
+        host_port: 22, // not in 18000..=19999
+    }]);
+    let mut cfg = runtime_config();
+    cfg.port_binding_allowed_range = Some((18000, 19999));
+    let err = enforce_and_build_port_bindings(&template, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("allowed range"),
+        "msg: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn port_bindings_container_port_zero_rejected() {
+    let template = port_template(vec![ProtoPortBinding {
+        container_port: 0,
+        host_port: 18765,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.port_binding_allowed_range = Some((18000, 19999));
+    let err = enforce_and_build_port_bindings(&template, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+#[test]
+fn port_bindings_host_port_zero_rejected() {
+    let template = port_template(vec![ProtoPortBinding {
+        container_port: 8765,
+        host_port: 0,
+    }]);
+    let mut cfg = runtime_config();
+    // Range starts at 0 so the range check itself wouldn't reject 0; the
+    // explicit "not a valid TCP port" branch is what must fire.
+    cfg.port_binding_allowed_range = Some((0, 19999));
+    let err = enforce_and_build_port_bindings(&template, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("not a valid TCP port"),
+        "msg: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn port_bindings_host_port_above_u16_rejected() {
+    let template = port_template(vec![ProtoPortBinding {
+        container_port: 8765,
+        host_port: 70_000,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.port_binding_allowed_range = Some((18000, 19999));
+    let err = enforce_and_build_port_bindings(&template, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("out of range"),
+        "msg: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn port_bindings_duplicate_container_port_rejected() {
+    let template = port_template(vec![
+        ProtoPortBinding {
+            container_port: 8765,
+            host_port: 18765,
+        },
+        ProtoPortBinding {
+            container_port: 8765,
+            host_port: 18766,
+        },
+    ]);
+    let mut cfg = runtime_config();
+    cfg.port_binding_allowed_range = Some((18000, 19999));
+    let err = enforce_and_build_port_bindings(&template, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("duplicate"),
+        "msg: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn bind_mounts_empty_request_returns_empty_vec() {
+    let template = mount_template(Vec::new());
+    let cfg = runtime_config();
+    let sandbox = test_sandbox();
+    assert!(
+        enforce_and_build_bind_mounts(&template, &sandbox, &cfg)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn bind_mounts_rejected_when_driver_has_no_allow_templates() {
+    let tmp = TempDir::new().unwrap();
+    let template = mount_template(vec![BindMount {
+        host_path: tmp.path().display().to_string(),
+        container_path: "/workspace".to_string(),
+        read_only: None,
+    }]);
+    let cfg = runtime_config();
+    let sandbox = test_sandbox();
+    let err = enforce_and_build_bind_mounts(&template, &sandbox, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("disabled"), "msg: {}", err.message());
+}
+
+#[test]
+fn bind_mounts_within_allow_template_default_read_only() {
+    let tmp = TempDir::new().unwrap();
+    let sandbox_dir = tmp.path().join("sandboxes").join("sbx-123");
+    fs::create_dir_all(&sandbox_dir).unwrap();
+    let template = mount_template(vec![BindMount {
+        host_path: sandbox_dir.display().to_string(),
+        container_path: "/home/agent/workspace".to_string(),
+        read_only: None,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.bind_mount_allowed_path_templates = vec![format!(
+        "{}/sandboxes/{{sandbox_id}}",
+        tmp.path().display()
+    )];
+    let sandbox = test_sandbox();
+    let binds = enforce_and_build_bind_mounts(&template, &sandbox, &cfg).unwrap();
+    assert_eq!(binds.len(), 1);
+    let canonical_sandbox_dir = fs::canonicalize(&sandbox_dir).unwrap();
+    assert_eq!(
+        binds[0],
+        format!(
+            "{}:{}:ro,z",
+            canonical_sandbox_dir.display(),
+            "/home/agent/workspace"
+        )
+    );
+}
+
+#[test]
+fn bind_mounts_explicit_writable_emits_rw() {
+    let tmp = TempDir::new().unwrap();
+    let sandbox_dir = tmp.path().join("sandboxes").join("sbx-123");
+    fs::create_dir_all(&sandbox_dir).unwrap();
+    let template = mount_template(vec![BindMount {
+        host_path: sandbox_dir.display().to_string(),
+        container_path: "/home/agent/workspace".to_string(),
+        read_only: Some(false),
+    }]);
+    let mut cfg = runtime_config();
+    cfg.bind_mount_allowed_path_templates = vec![format!(
+        "{}/sandboxes/{{sandbox_id}}",
+        tmp.path().display()
+    )];
+    let sandbox = test_sandbox();
+    let binds = enforce_and_build_bind_mounts(&template, &sandbox, &cfg).unwrap();
+    assert!(
+        binds[0].ends_with(":rw,z"),
+        "expected SELinux-labelled rw bind, got {}",
+        binds[0]
+    );
+}
+
+#[test]
+fn bind_mounts_outside_allow_template_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let outside_dir = tmp.path().join("not-in-sandboxes");
+    fs::create_dir_all(&outside_dir).unwrap();
+    let template = mount_template(vec![BindMount {
+        host_path: outside_dir.display().to_string(),
+        container_path: "/workspace".to_string(),
+        read_only: None,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.bind_mount_allowed_path_templates = vec![format!(
+        "{}/sandboxes/{{sandbox_id}}",
+        tmp.path().display()
+    )];
+    let sandbox = test_sandbox();
+    let err = enforce_and_build_bind_mounts(&template, &sandbox, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(
+        err.message().contains("allowed template"),
+        "msg: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn bind_mounts_cross_sandbox_id_rejected() {
+    // sandbox id = "sbx-123" (from test_sandbox()) must not be able to mount
+    // another sandbox's directory even though both are under sandboxes/.
+    let tmp = TempDir::new().unwrap();
+    let other_dir = tmp.path().join("sandboxes").join("other-sandbox-id");
+    fs::create_dir_all(&other_dir).unwrap();
+    let template = mount_template(vec![BindMount {
+        host_path: other_dir.display().to_string(),
+        container_path: "/workspace".to_string(),
+        read_only: None,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.bind_mount_allowed_path_templates = vec![format!(
+        "{}/sandboxes/{{sandbox_id}}",
+        tmp.path().display()
+    )];
+    let sandbox = test_sandbox();
+    let err = enforce_and_build_bind_mounts(&template, &sandbox, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+}
+
+#[test]
+fn bind_mounts_relative_host_path_rejected() {
+    let template = mount_template(vec![BindMount {
+        host_path: "relative/path".to_string(),
+        container_path: "/workspace".to_string(),
+        read_only: None,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.bind_mount_allowed_path_templates = vec!["/anywhere/{sandbox_id}".to_string()];
+    let sandbox = test_sandbox();
+    let err = enforce_and_build_bind_mounts(&template, &sandbox, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("absolute"), "msg: {}", err.message());
+}
+
+#[test]
+fn bind_mounts_host_path_with_colon_rejected() {
+    let template = mount_template(vec![BindMount {
+        host_path: "/tmp/with:colon".to_string(),
+        container_path: "/workspace".to_string(),
+        read_only: None,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.bind_mount_allowed_path_templates = vec!["/tmp/{sandbox_id}".to_string()];
+    let sandbox = test_sandbox();
+    let err = enforce_and_build_bind_mounts(&template, &sandbox, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("':'"), "msg: {}", err.message());
+}
+
+#[test]
+fn bind_mounts_nonexistent_host_path_rejected() {
+    let template = mount_template(vec![BindMount {
+        host_path: "/definitely/not/real/path/xyzzy".to_string(),
+        container_path: "/workspace".to_string(),
+        read_only: None,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.bind_mount_allowed_path_templates = vec!["/definitely/{sandbox_id}".to_string()];
+    let sandbox = test_sandbox();
+    let err = enforce_and_build_bind_mounts(&template, &sandbox, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("canonicalize"), "msg: {}", err.message());
+}
+
+#[test]
+fn bind_mounts_builtin_deny_takes_precedence_over_allow() {
+    // Even if operator misconfigures allow_templates to cover /etc, the
+    // built-in deny list must win.
+    let template = mount_template(vec![BindMount {
+        host_path: "/etc/hostname".to_string(),
+        container_path: "/etc/hostname-in-container".to_string(),
+        read_only: None,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.bind_mount_allowed_path_templates = vec!["/etc".to_string()];
+    let sandbox = test_sandbox();
+    let err = enforce_and_build_bind_mounts(&template, &sandbox, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(
+        err.message().contains("denied prefix"),
+        "msg: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn bind_mounts_extra_denied_path_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let evil = tmp.path().join("evil");
+    fs::create_dir_all(&evil).unwrap();
+    let template = mount_template(vec![BindMount {
+        host_path: evil.display().to_string(),
+        container_path: "/workspace".to_string(),
+        read_only: None,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.bind_mount_allowed_path_templates = vec![format!("{}", tmp.path().display())];
+    let canonical_tmp = fs::canonicalize(tmp.path()).unwrap();
+    cfg.bind_mount_extra_denied_paths =
+        vec![format!("{}/evil", canonical_tmp.display())];
+    let sandbox = test_sandbox();
+    let err = enforce_and_build_bind_mounts(&template, &sandbox, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+}
+
+// ---------------------------------------------------------------------------
+// Path-escape regression coverage.
+//
+// `canonicalize` exists in `enforce_and_build_bind_mounts` for one reason
+// only: defeat symlink and `..` tricks that would otherwise let a request
+// allowed by the template name leak into a denied destination (or into a
+// sibling sandbox's directory).  These tests assert that the canonicalize
+// → deny → allow ordering actually does what the doc claims.  Pre-existing
+// "host_path inside template root" tests do NOT cover this, because their
+// inputs are already canonical.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn bind_mounts_symlink_target_to_deny_prefix_rejected() {
+    use std::os::unix::fs::symlink;
+    let tmp = TempDir::new().unwrap();
+    let sandbox_dir = tmp.path().join("sandboxes").join("sbx-123");
+    fs::create_dir_all(&sandbox_dir).unwrap();
+    // `escape` lives inside the allowed sandbox prefix, but its symlink
+    // target is `/etc` (a builtin deny).  Without canonicalize, the deny
+    // check would see the in-prefix path and let it through.
+    let escape = sandbox_dir.join("escape");
+    symlink("/etc", &escape).unwrap();
+
+    let template = mount_template(vec![BindMount {
+        host_path: escape.display().to_string(),
+        container_path: "/workspace".to_string(),
+        read_only: None,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.bind_mount_allowed_path_templates = vec![format!(
+        "{}/sandboxes/{{sandbox_id}}",
+        tmp.path().display()
+    )];
+    let sandbox = test_sandbox();
+    let err = enforce_and_build_bind_mounts(&template, &sandbox, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(
+        err.message().contains("denied prefix"),
+        "expected denied-prefix rejection, got: {}",
+        err.message()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bind_mounts_dotdot_escape_to_deny_prefix_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let sandbox_dir = tmp.path().join("sandboxes").join("sbx-123");
+    fs::create_dir_all(&sandbox_dir).unwrap();
+    // Path syntactically threads `..` segments to climb out of the
+    // sandbox dir and land on `/etc/passwd`.  Without canonicalize, the
+    // raw string starts with the allow prefix and would pass.
+    let escaping = sandbox_dir.join("../../../../etc/passwd");
+
+    let template = mount_template(vec![BindMount {
+        host_path: escaping.display().to_string(),
+        container_path: "/workspace".to_string(),
+        read_only: None,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.bind_mount_allowed_path_templates = vec![format!(
+        "{}/sandboxes/{{sandbox_id}}",
+        tmp.path().display()
+    )];
+    let sandbox = test_sandbox();
+    let err = enforce_and_build_bind_mounts(&template, &sandbox, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(
+        err.message().contains("denied prefix"),
+        "expected denied-prefix rejection, got: {}",
+        err.message()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn bind_mounts_symlink_target_to_sibling_sandbox_rejected() {
+    use std::os::unix::fs::symlink;
+    let tmp = TempDir::new().unwrap();
+    let my_sandbox = tmp.path().join("sandboxes").join("sbx-123");
+    let other_sandbox = tmp
+        .path()
+        .join("sandboxes")
+        .join("other-sandbox")
+        .join("secrets");
+    fs::create_dir_all(&my_sandbox).unwrap();
+    fs::create_dir_all(&other_sandbox).unwrap();
+    // `leak` lives in sbx-123's prefix but resolves into another
+    // sandbox's secrets dir.  Allow template renders per-sandbox-id, so
+    // the resolved path must NOT start with the prefix for this sandbox.
+    let leak = my_sandbox.join("leak");
+    symlink(&other_sandbox, &leak).unwrap();
+
+    let template = mount_template(vec![BindMount {
+        host_path: leak.display().to_string(),
+        container_path: "/workspace".to_string(),
+        read_only: None,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.bind_mount_allowed_path_templates = vec![format!(
+        "{}/sandboxes/{{sandbox_id}}",
+        tmp.path().display()
+    )];
+    let sandbox = test_sandbox(); // id = "sbx-123"
+    let err = enforce_and_build_bind_mounts(&template, &sandbox, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(
+        err.message().contains("not within any allowed template prefix"),
+        "expected cross-sandbox rejection, got: {}",
+        err.message()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Symmetry: container_path validation mirrors host_path validation.
+// The driver has two parallel hand-written branches; these regression tests
+// keep them in lockstep so a future refactor on one side fails loudly.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bind_mounts_container_path_with_colon_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let sandbox_dir = tmp.path().join("sandboxes").join("sbx-123");
+    fs::create_dir_all(&sandbox_dir).unwrap();
+    let template = mount_template(vec![BindMount {
+        host_path: sandbox_dir.display().to_string(),
+        container_path: "/work:space".to_string(),
+        read_only: None,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.bind_mount_allowed_path_templates = vec![format!(
+        "{}/sandboxes/{{sandbox_id}}",
+        tmp.path().display()
+    )];
+    let sandbox = test_sandbox();
+    let err = enforce_and_build_bind_mounts(&template, &sandbox, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("':'"),
+        "msg: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn bind_mounts_container_path_non_absolute_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let sandbox_dir = tmp.path().join("sandboxes").join("sbx-123");
+    fs::create_dir_all(&sandbox_dir).unwrap();
+    let template = mount_template(vec![BindMount {
+        host_path: sandbox_dir.display().to_string(),
+        container_path: "workspace".to_string(),
+        read_only: None,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.bind_mount_allowed_path_templates = vec![format!(
+        "{}/sandboxes/{{sandbox_id}}",
+        tmp.path().display()
+    )];
+    let sandbox = test_sandbox();
+    let err = enforce_and_build_bind_mounts(&template, &sandbox, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("container_path") && err.message().contains("absolute"),
+        "msg: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn bind_mounts_container_path_empty_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let sandbox_dir = tmp.path().join("sandboxes").join("sbx-123");
+    fs::create_dir_all(&sandbox_dir).unwrap();
+    let template = mount_template(vec![BindMount {
+        host_path: sandbox_dir.display().to_string(),
+        container_path: String::new(),
+        read_only: None,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.bind_mount_allowed_path_templates = vec![format!(
+        "{}/sandboxes/{{sandbox_id}}",
+        tmp.path().display()
+    )];
+    let sandbox = test_sandbox();
+    let err = enforce_and_build_bind_mounts(&template, &sandbox, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("container_path"),
+        "msg: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn port_bindings_container_port_above_u16_rejected() {
+    let template = port_template(vec![ProtoPortBinding {
+        container_port: 70_000,
+        host_port: 18765,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.port_binding_allowed_range = Some((18000, 19999));
+    let err = enforce_and_build_port_bindings(&template, &cfg).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("container_port") && err.message().contains("out of range"),
+        "msg: {}",
+        err.message()
+    );
+}
+
+#[test]
+fn bind_mounts_explicit_read_only_true_matches_default() {
+    let tmp = TempDir::new().unwrap();
+    let sandbox_dir = tmp.path().join("sandboxes").join("sbx-123");
+    fs::create_dir_all(&sandbox_dir).unwrap();
+    let template_explicit = mount_template(vec![BindMount {
+        host_path: sandbox_dir.display().to_string(),
+        container_path: "/workspace".to_string(),
+        read_only: Some(true),
+    }]);
+    let template_default = mount_template(vec![BindMount {
+        host_path: sandbox_dir.display().to_string(),
+        container_path: "/workspace".to_string(),
+        read_only: None,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.bind_mount_allowed_path_templates = vec![format!(
+        "{}/sandboxes/{{sandbox_id}}",
+        tmp.path().display()
+    )];
+    let sandbox = test_sandbox();
+    let from_explicit =
+        enforce_and_build_bind_mounts(&template_explicit, &sandbox, &cfg).unwrap();
+    let from_default =
+        enforce_and_build_bind_mounts(&template_default, &sandbox, &cfg).unwrap();
+    assert_eq!(from_explicit, from_default);
+    assert!(
+        from_explicit[0].ends_with(":ro,z"),
+        "bind = {}",
+        from_explicit[0]
+    );
+}
+
+#[test]
+fn bind_mounts_multiple_translated_preserve_order_and_modes() {
+    let tmp = TempDir::new().unwrap();
+    let dir_a = tmp.path().join("sandboxes").join("sbx-123").join("a");
+    let dir_b = tmp.path().join("sandboxes").join("sbx-123").join("b");
+    fs::create_dir_all(&dir_a).unwrap();
+    fs::create_dir_all(&dir_b).unwrap();
+    let template = mount_template(vec![
+        BindMount {
+            host_path: dir_a.display().to_string(),
+            container_path: "/work/a".to_string(),
+            read_only: None,
+        },
+        BindMount {
+            host_path: dir_b.display().to_string(),
+            container_path: "/work/b".to_string(),
+            read_only: Some(false),
+        },
+    ]);
+    let mut cfg = runtime_config();
+    cfg.bind_mount_allowed_path_templates = vec![format!(
+        "{}/sandboxes/{{sandbox_id}}",
+        tmp.path().display()
+    )];
+    let sandbox = test_sandbox();
+    let binds = enforce_and_build_bind_mounts(&template, &sandbox, &cfg).unwrap();
+    assert_eq!(binds.len(), 2);
+    assert!(binds[0].contains("/work/a"), "bind[0] = {}", binds[0]);
+    assert!(
+        binds[0].ends_with(":ro,z"),
+        "bind[0] missing SELinux/ro suffix: {}",
+        binds[0]
+    );
+    assert!(binds[1].contains("/work/b"), "bind[1] = {}", binds[1]);
+    assert!(
+        binds[1].ends_with(":rw,z"),
+        "bind[1] missing SELinux/rw suffix: {}",
+        binds[1]
+    );
+}
+
+#[test]
+fn bind_mounts_sandbox_name_placeholder_renders() {
+    // Allow template references only {sandbox_name} (no {sandbox_id}) to
+    // prove the placeholder fires independently of the more commonly used
+    // sandbox_id substitution.
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("named").join("demo");
+    fs::create_dir_all(&dir).unwrap();
+    let template = mount_template(vec![BindMount {
+        host_path: dir.display().to_string(),
+        container_path: "/workspace".to_string(),
+        read_only: None,
+    }]);
+    let mut cfg = runtime_config();
+    cfg.bind_mount_allowed_path_templates = vec![format!(
+        "{}/named/{{sandbox_name}}",
+        tmp.path().display()
+    )];
+    let sandbox = test_sandbox(); // name = "demo"
+    let binds = enforce_and_build_bind_mounts(&template, &sandbox, &cfg).unwrap();
+    assert_eq!(binds.len(), 1);
+    assert!(
+        binds[0].contains("/named/demo:"),
+        "expected rendered prefix in bind: {}",
+        binds[0]
+    );
 }

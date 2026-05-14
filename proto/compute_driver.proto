@@ -92,6 +92,29 @@ message DriverSandboxSpec {
   string gpu_device = 10;
 }
 
+// Container port published on the host loopback (driver-internal mirror of
+// `openshell.v1.PortBinding`). Enforcement contract is identical; see the
+// public message for the authoritative rules. Defined here independently so
+// driver-internal protos do not import the public OpenShell API surface.
+message PortBinding {
+  // Container-side TCP port. Must be in (0, 65535].
+  uint32 container_port = 1;
+  // Host-side TCP port on 127.0.0.1.
+  uint32 host_port = 2;
+}
+
+// Host directory bind-mounted into the container (driver-internal mirror of
+// `openshell.v1.BindMount`). Enforcement contract is identical; see the
+// public message for the authoritative rules.
+message BindMount {
+  // Host filesystem path (absolute).
+  string host_path = 1;
+  // Mount path inside the container (absolute).
+  string container_path = 2;
+  // When true (default), mount read-only.
+  optional bool read_only = 3;
+}
+
 // Driver-owned runtime template consumed by the compute platform.
 //
 // This message describes the sandbox workload in backend-neutral terms.
@@ -115,6 +138,15 @@ message DriverSandboxTemplate {
   // For the Kubernetes driver this carries fields such as runtimeClassName,
   // annotations, and volumeClaimTemplates.
   google.protobuf.Struct platform_config = 11;
+  // Host-published container ports. Drivers enforce host_port allow-list
+  // and bind exclusively to 127.0.0.1. Drivers that do not support host
+  // port publishing must reject non-empty values with `INVALID_ARGUMENT`.
+  repeated PortBinding port_bindings = 12;
+  // Host directories bind-mounted into the container. Drivers enforce path
+  // canonicalization, deny-list (taking precedence), and allow-list
+  // templates rendered for this sandbox. Drivers that do not support host
+  // bind mounts must reject non-empty values with `INVALID_ARGUMENT`.
+  repeated BindMount bind_mounts = 13;
 }
 
 // Typed compute-resource requirements.

@@ -9,8 +9,8 @@ use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, DeviceRequest,
-    EndpointSettings, HostConfig, NetworkCreateRequest, NetworkingConfig, RestartPolicy,
-    RestartPolicyNameEnum, SystemInfo,
+    EndpointSettings, HostConfig, NetworkCreateRequest, NetworkingConfig,
+    PortBinding as DockerPortBinding, RestartPolicy, RestartPolicyNameEnum, SystemInfo,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -149,7 +149,50 @@ pub struct DockerComputeConfig {
 
     /// Docker bridge network that sandbox containers join.
     pub network_name: String,
+
+    /// Allow-list for `PortBinding.host_port` (inclusive on both ends).
+    /// `None` disables host port publishing for this driver — any sandbox
+    /// request carrying non-empty `port_bindings` is rejected. When set,
+    /// `host_port` must lie within `[start, end]`. Driver binds the host
+    /// side exclusively to 127.0.0.1 regardless of this value.
+    pub port_binding_allowed_range: Option<(u16, u16)>,
+
+    /// Allow-list templates for `BindMount.host_path`. Each template is
+    /// rendered per sandbox with placeholders `{sandbox_id}` and
+    /// `{sandbox_name}` substituted, then the request's canonical host
+    /// path must start with at least one rendered prefix.
+    ///
+    /// `{namespace}` is intentionally NOT supported: the gateway elides
+    /// `DriverSandbox.namespace` on the create path (containers are
+    /// labelled with `config.sandbox_namespace` instead, see
+    /// `build_container_create_body`), so accepting `{namespace}` here
+    /// would silently render to `""` and never match anything in
+    /// practice.
+    /// Empty (`Vec::new()`) disables host bind mounts entirely; any
+    /// non-empty `bind_mounts` in a sandbox request is rejected.
+    pub bind_mount_allowed_path_templates: Vec<String>,
+
+    /// Extra hard-deny prefixes for `BindMount.host_path`, appended to the
+    /// driver's built-in deny list (`/`, `/etc`, `/proc`, `/sys`, `/dev`,
+    /// `/var/run/docker.sock`, `/var/lib/docker`, `/run/openshell`,
+    /// `/var/lib/openshell`). Match short-circuits before any allow check.
+    pub bind_mount_extra_denied_paths: Vec<String>,
 }
+
+/// Built-in hard-deny prefixes for `BindMount.host_path`. Matched **before**
+/// any allow-list check. Operators may extend this via
+/// `DockerComputeConfig::bind_mount_extra_denied_paths` but cannot shorten
+/// it from configuration.
+const BIND_MOUNT_BUILTIN_DENIED_PATHS: &[&str] = &[
+    "/etc",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/var/run/docker.sock",
+    "/var/lib/docker",
+    "/run/openshell",
+    "/var/lib/openshell",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DockerGuestTlsPaths {
@@ -173,6 +216,12 @@ struct DockerDriverRuntimeConfig {
     guest_tls: Option<DockerGuestTlsPaths>,
     daemon_version: String,
     supports_gpu: bool,
+    /// Allow-list for host-published ports. See `DockerComputeConfig`.
+    port_binding_allowed_range: Option<(u16, u16)>,
+    /// Allow-list templates for host bind mount paths.
+    bind_mount_allowed_path_templates: Vec<String>,
+    /// Operator-supplied extra deny prefixes; merged with the built-in list.
+    bind_mount_extra_denied_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,6 +310,13 @@ impl DockerComputeDriver {
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
                 supports_gpu,
+                port_binding_allowed_range: docker_config.port_binding_allowed_range,
+                bind_mount_allowed_path_templates: docker_config
+                    .bind_mount_allowed_path_templates
+                    .clone(),
+                bind_mount_extra_denied_paths: docker_config
+                    .bind_mount_extra_denied_paths
+                    .clone(),
             },
             events: broadcast::channel(WATCH_BUFFER).0,
             supervisor_readiness,
@@ -887,6 +943,222 @@ fn build_binds(config: &DockerDriverRuntimeConfig) -> Vec<String> {
     binds
 }
 
+/// Substitute `{sandbox_id}` / `{sandbox_name}` placeholders in a
+/// bind-mount allow-list template against a concrete sandbox.
+///
+/// `{namespace}` is deliberately not handled here: the gateway elides
+/// `DriverSandbox.namespace` on the create path (containers are labelled
+/// with `config.sandbox_namespace` — see `build_container_create_body`),
+/// so a template referencing `{namespace}` would silently render to `""`
+/// and never match. Operators wanting per-namespace isolation should
+/// configure a per-namespace gateway instance instead.
+fn render_bind_mount_template(template: &str, sandbox: &DriverSandbox) -> String {
+    template
+        .replace("{sandbox_id}", &sandbox.id)
+        .replace("{sandbox_name}", &sandbox.name)
+}
+
+/// Enforce `template.port_bindings` against driver policy and translate them
+/// into bollard's `HostConfig.port_bindings` shape. Returns `Ok(None)` when
+/// the sandbox requests no published ports.
+///
+/// Enforcement (driver layer is the trust boundary; the gateway is not):
+///   - host_port must lie within `port_binding_allowed_range`. If the
+///     driver has no range configured, any non-empty `port_bindings` is
+///     rejected.
+///   - both ports must be in `(0, 65535]`.
+///   - container_port is unique within the request (TCP only).
+///   - host bind address is always 127.0.0.1 (caller cannot override).
+fn enforce_and_build_port_bindings(
+    template: &DriverSandboxTemplate,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<Option<HashMap<String, Option<Vec<DockerPortBinding>>>>, Status> {
+    if template.port_bindings.is_empty() {
+        return Ok(None);
+    }
+
+    let (range_lo, range_hi) = config.port_binding_allowed_range.ok_or_else(|| {
+        Status::invalid_argument(
+            "port_bindings: host port publishing is disabled on this driver",
+        )
+    })?;
+
+    let mut seen = std::collections::HashSet::<u32>::new();
+    let mut bindings: HashMap<String, Option<Vec<DockerPortBinding>>> = HashMap::new();
+
+    for pb in &template.port_bindings {
+        if pb.container_port == 0 || pb.container_port > 65_535 {
+            return Err(Status::invalid_argument(format!(
+                "port_bindings.container_port {} is out of range (1..=65535)",
+                pb.container_port
+            )));
+        }
+        // `try_from` catches the upper end of the u32→u16 cast (the proto
+        // field is u32, so anything >65535 is invalid). Port 0 is in u16
+        // range but not a valid TCP port, so it's rejected explicitly below.
+        let host_port_u16 = u16::try_from(pb.host_port).map_err(|_| {
+            Status::invalid_argument(format!(
+                "port_bindings.host_port {} is out of range (1..=65535)",
+                pb.host_port
+            ))
+        })?;
+        if host_port_u16 == 0 {
+            return Err(Status::invalid_argument(
+                "port_bindings.host_port 0 is not a valid TCP port".to_string(),
+            ));
+        }
+        if host_port_u16 < range_lo || host_port_u16 > range_hi {
+            return Err(Status::invalid_argument(format!(
+                "port_bindings.host_port {} is outside the driver's allowed range [{}, {}]",
+                host_port_u16, range_lo, range_hi
+            )));
+        }
+        if !seen.insert(pb.container_port) {
+            return Err(Status::invalid_argument(format!(
+                "port_bindings: duplicate container_port {} (tcp) within the request",
+                pb.container_port
+            )));
+        }
+        bindings.insert(
+            format!("{}/tcp", pb.container_port),
+            Some(vec![DockerPortBinding {
+                host_ip: Some("127.0.0.1".to_string()),
+                host_port: Some(pb.host_port.to_string()),
+            }]),
+        );
+    }
+    Ok(Some(bindings))
+}
+
+/// Enforce `template.bind_mounts` against driver policy and translate them
+/// into bollard's bind-string format (`<host>:<container>:<ro|rw>`).
+///
+/// Enforcement (driver layer is the trust boundary; the gateway is not):
+///   - host_path and container_path are absolute, non-empty, and contain no `:`.
+///   - host_path canonicalizes successfully (path must exist; symlinks are
+///     followed; `..` components are resolved).
+///   - canonical host_path is NOT prefixed by any built-in or operator-supplied
+///     deny path. Built-ins (`/etc`, `/proc`, `/sys`, `/dev`,
+///     `/var/run/docker.sock`, `/var/lib/docker`, `/run/openshell`,
+///     `/var/lib/openshell`) cannot be removed from configuration.
+///   - canonical host_path IS prefixed by at least one allow-list template
+///     rendered against this sandbox. If the driver has no templates
+///     configured, any non-empty `bind_mounts` is rejected.
+///   - `read_only` defaults to `true` when unset.
+fn enforce_and_build_bind_mounts(
+    template: &DriverSandboxTemplate,
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<Vec<String>, Status> {
+    if template.bind_mounts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if config.bind_mount_allowed_path_templates.is_empty() {
+        return Err(Status::invalid_argument(
+            "bind_mounts: host bind mounts are disabled on this driver",
+        ));
+    }
+
+    let allow_prefixes: Vec<PathBuf> = config
+        .bind_mount_allowed_path_templates
+        .iter()
+        .map(|t| PathBuf::from(render_bind_mount_template(t, sandbox)))
+        .collect();
+
+    let denied_prefixes: Vec<PathBuf> = BIND_MOUNT_BUILTIN_DENIED_PATHS
+        .iter()
+        .map(|s| PathBuf::from(*s))
+        .chain(
+            config
+                .bind_mount_extra_denied_paths
+                .iter()
+                .map(PathBuf::from),
+        )
+        .collect();
+
+    let mut result = Vec::with_capacity(template.bind_mounts.len());
+    for bm in &template.bind_mounts {
+        if bm.host_path.is_empty() {
+            return Err(Status::invalid_argument(
+                "bind_mounts.host_path must not be empty",
+            ));
+        }
+        if bm.container_path.is_empty() {
+            return Err(Status::invalid_argument(
+                "bind_mounts.container_path must not be empty",
+            ));
+        }
+        if !bm.host_path.starts_with('/') {
+            return Err(Status::invalid_argument(format!(
+                "bind_mounts.host_path {} must be absolute",
+                bm.host_path
+            )));
+        }
+        if !bm.container_path.starts_with('/') {
+            return Err(Status::invalid_argument(format!(
+                "bind_mounts.container_path {} must be absolute",
+                bm.container_path
+            )));
+        }
+        if bm.host_path.contains(':') || bm.container_path.contains(':') {
+            return Err(Status::invalid_argument(
+                "bind_mounts paths must not contain ':' (driver uses ':' as bind separator)",
+            ));
+        }
+
+        let canonical = std::fs::canonicalize(&bm.host_path).map_err(|e| {
+            Status::invalid_argument(format!(
+                "bind_mounts.host_path {} cannot be canonicalized: {}",
+                bm.host_path, e
+            ))
+        })?;
+
+        // Built-in + operator-supplied deny list short-circuits before any
+        // allow check, by design — operators can extend but not weaken it.
+        if denied_prefixes
+            .iter()
+            .any(|d| canonical.starts_with(d))
+        {
+            return Err(Status::permission_denied(format!(
+                "bind_mounts.host_path {} resolves to a driver-denied prefix",
+                bm.host_path
+            )));
+        }
+
+        if !allow_prefixes
+            .iter()
+            .any(|p| canonical.starts_with(p))
+        {
+            return Err(Status::permission_denied(format!(
+                "bind_mounts.host_path {} is not within any allowed template prefix for this sandbox",
+                bm.host_path
+            )));
+        }
+
+        // SELinux relabeling: match `build_binds` (which applies `,z` to
+        // every internal bind for the supervisor binary and TLS material).
+        // On SELinux-enforcing hosts (RHEL/Fedora/CentOS Stream/Amazon
+        // Linux 2023 — all common production substrates) an unlabeled
+        // bind would be rejected by the kernel with EACCES and the agent
+        // would see `Permission denied` inside the container with no clue
+        // why.  `,z` requests a shared label so multiple sandboxes can
+        // safely mount overlapping prefixes; we deliberately do NOT use
+        // `,Z` (private) because the driver allows multiple sandboxes to
+        // share an allow-list prefix and a private relabel would clobber
+        // the previous sandbox's view on every create.
+        let ro = bm.read_only.unwrap_or(true);
+        let mode = if ro { "ro,z" } else { "rw,z" };
+        result.push(format!(
+            "{}:{}:{}",
+            canonical.display(),
+            bm.container_path,
+            mode
+        ));
+    }
+    Ok(result)
+}
+
 fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) -> Vec<String> {
     let mut environment = HashMap::from([
         ("HOME".to_string(), "/root".to_string()),
@@ -984,6 +1256,13 @@ fn build_container_create_body(
         config.sandbox_namespace.clone(),
     );
 
+    // Enforce + translate user-supplied port bindings and bind mounts at the
+    // driver boundary. Errors here are surfaced as gRPC `Status` codes.
+    let port_bindings = enforce_and_build_port_bindings(template, config)?;
+    let user_bind_mounts = enforce_and_build_bind_mounts(template, sandbox, config)?;
+    let mut binds = build_binds(config);
+    binds.extend(user_bind_mounts);
+
     Ok(ContainerCreateBody {
         image: Some(template.image.clone()),
         user: Some("0".to_string()),
@@ -997,7 +1276,8 @@ fn build_container_create_body(
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
             device_requests: docker_gpu_device_requests(spec.gpu, &spec.gpu_device),
-            binds: Some(build_binds(config)),
+            binds: Some(binds),
+            port_bindings,
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                 maximum_retry_count: None,

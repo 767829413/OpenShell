@@ -19,6 +19,7 @@ use openshell_bootstrap::{
 use openshell_cli::completers;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
+use openshell_core::proto::{BindMount, PortBinding};
 
 /// Resolved gateway context: name + gateway endpoint.
 struct GatewayContext {
@@ -1129,6 +1130,23 @@ enum SandboxCommands {
         /// Attach labels to the sandbox (key=value format, repeatable).
         #[arg(long = "label")]
         labels: Vec<String>,
+
+        /// Publish a container port on the host loopback. Repeatable.
+        /// Format: `HOST_PORT:CONTAINER_PORT` (e.g. `18765:8765`).
+        /// Driver enforces host_port allow-list and binds to 127.0.0.1.
+        #[arg(long = "port-binding", value_name = "HOST_PORT:CONTAINER_PORT")]
+        port_bindings: Vec<String>,
+
+        /// Bind-mount a host directory into the container. Repeatable.
+        /// Format: `HOST_PATH:CONTAINER_PATH[:ro|:rw]` (default `ro`).
+        /// Paths must be absolute and must not contain `:`. Driver
+        /// canonicalizes host_path and applies per-sandbox allow/deny
+        /// lists.
+        #[arg(
+            long = "bind-mount",
+            value_name = "HOST_PATH:CONTAINER_PATH[:ro|:rw]"
+        )]
+        bind_mounts: Vec<String>,
 
         /// Command to run after "--" (defaults to an interactive shell).
         #[arg(last = true, allow_hyphen_values = true)]
@@ -2373,6 +2391,8 @@ async fn main() -> Result<()> {
                     auto_providers,
                     no_auto_providers,
                     labels,
+                    port_bindings,
+                    bind_mounts,
                     command,
                 } => {
                     // Resolve --tty / --no-tty into an Option<bool> override.
@@ -2412,6 +2432,19 @@ async fn main() -> Result<()> {
                         (local, remote, !no_git_ignore)
                     });
 
+                    // Parse --port-binding flags. Errors here are surfaced
+                    // to the user before any gateway round-trip.
+                    let parsed_port_bindings: Vec<PortBinding> = port_bindings
+                        .iter()
+                        .map(|s| run::parse_port_binding(s))
+                        .collect::<Result<Vec<_>>>()?;
+
+                    // Parse --bind-mount flags.
+                    let parsed_bind_mounts: Vec<BindMount> = bind_mounts
+                        .iter()
+                        .map(|s| run::parse_bind_mount(s))
+                        .collect::<Result<Vec<_>>>()?;
+
                     let editor = editor.map(Into::into);
                     let forward = forward
                         .map(|s| openshell_core::forward::ForwardSpec::parse(&s))
@@ -2439,6 +2472,8 @@ async fn main() -> Result<()> {
                         tty_override,
                         auto_providers_override,
                         &labels_map,
+                        &parsed_port_bindings,
+                        &parsed_bind_mounts,
                         &tls,
                     ))
                     .await?;

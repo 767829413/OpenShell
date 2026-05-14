@@ -237,6 +237,57 @@ struct RunArgs {
     )]
     docker_network_name: String,
 
+    /// Allow-list for `PortBinding.host_port` on the Docker driver, expressed
+    /// as `<start>-<end>` (inclusive on both ends).  When unset (the default),
+    /// any sandbox request carrying a non-empty `port_bindings` field is
+    /// rejected with `InvalidArgument` — port publishing is opt-in per
+    /// deployment.  Driver binds the host side exclusively to 127.0.0.1
+    /// regardless of this value.
+    #[arg(
+        long,
+        env = "OPENSHELL_DOCKER_PORT_BINDING_RANGE",
+        value_parser = parse_port_binding_range
+    )]
+    docker_port_binding_range: Option<(u16, u16)>,
+
+    /// Allow-list templates for `BindMount.host_path` on the Docker driver.
+    /// Repeatable.  Each template is rendered per sandbox with placeholders
+    /// `{sandbox_id}` and `{sandbox_name}` substituted (no `{namespace}` —
+    /// the driver labels containers with the gateway-wide
+    /// `--sandbox-namespace` rather than the per-request value, so a
+    /// `{namespace}` placeholder would silently render to `""`).  The
+    /// request's canonical host path must start with at least one rendered
+    /// prefix.  When unset (the default), any sandbox request carrying a
+    /// non-empty `bind_mounts` field is rejected — host bind mounts are
+    /// opt-in per deployment.
+    ///
+    /// Pass this flag once per template to express multiple allowed
+    /// prefixes.  Filesystem paths may contain commas, so this flag does
+    /// not split on `,`; the env-var form `OPENSHELL_DOCKER_BIND_MOUNT_
+    /// ALLOW_TEMPLATES` therefore accepts only a single template value.
+    #[arg(
+        long = "docker-bind-mount-allow-template",
+        env = "OPENSHELL_DOCKER_BIND_MOUNT_ALLOW_TEMPLATES",
+        action = clap::ArgAction::Append
+    )]
+    docker_bind_mount_allow_templates: Vec<String>,
+
+    /// Extra hard-deny prefixes for `BindMount.host_path`, appended to the
+    /// driver's built-in deny list (`/etc`, `/proc`, `/sys`, `/dev`,
+    /// `/var/run/docker.sock`, `/var/lib/docker`, `/run/openshell`,
+    /// `/var/lib/openshell`).  Built-ins cannot be shortened from CLI;
+    /// this only extends them.
+    ///
+    /// Pass this flag once per prefix to express multiple denies.  Same
+    /// rationale as `--docker-bind-mount-allow-template` for the lack of
+    /// comma splitting.
+    #[arg(
+        long = "docker-bind-mount-deny-extra",
+        env = "OPENSHELL_DOCKER_BIND_MOUNT_DENY_EXTRA",
+        action = clap::ArgAction::Append
+    )]
+    docker_bind_mount_deny_extra: Vec<String>,
+
     /// Enable Kubernetes user namespace isolation (hostUsers: false) for
     /// sandbox pods.
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
@@ -473,6 +524,9 @@ async fn run_from_args(args: RunArgs) -> Result<()> {
         guest_tls_cert: args.docker_tls_cert,
         guest_tls_key: args.docker_tls_key,
         network_name: args.docker_network_name,
+        port_binding_allowed_range: args.docker_port_binding_range,
+        bind_mount_allowed_path_templates: args.docker_bind_mount_allow_templates,
+        bind_mount_extra_denied_paths: args.docker_bind_mount_deny_extra,
     };
 
     if args.disable_tls {
@@ -490,6 +544,37 @@ async fn run_from_args(args: RunArgs) -> Result<()> {
 
 fn parse_compute_driver(value: &str) -> std::result::Result<ComputeDriverKind, String> {
     value.parse()
+}
+
+/// Parse `<start>-<end>` (e.g. `18000-19000`) into an inclusive `(u16, u16)`
+/// port range.  Used for `--docker-port-binding-range`.  Rejects:
+///   - missing `-` separator,
+///   - non-numeric components,
+///   - either side outside the valid TCP port domain,
+///   - inverted ranges (start > end),
+///   - zero ports (TCP port 0 is invalid for publishing).
+fn parse_port_binding_range(value: &str) -> std::result::Result<(u16, u16), String> {
+    let (lo, hi) = value
+        .split_once('-')
+        .ok_or_else(|| format!("expected `<start>-<end>` (e.g. 18000-19000), got `{}`", value))?;
+    let start: u16 = lo
+        .trim()
+        .parse()
+        .map_err(|err| format!("invalid start port `{}`: {}", lo, err))?;
+    let end: u16 = hi
+        .trim()
+        .parse()
+        .map_err(|err| format!("invalid end port `{}`: {}", hi, err))?;
+    if start == 0 || end == 0 {
+        return Err("port 0 is not a valid TCP port to publish".to_string());
+    }
+    if start > end {
+        return Err(format!(
+            "start port {} must be <= end port {}",
+            start, end
+        ));
+    }
+    Ok((start, end))
 }
 
 #[cfg(test)]
@@ -715,5 +800,65 @@ mod tests {
         let cli = Cli::try_parse_from(["openshell-gateway"]).expect("parses without --db-url");
         assert!(cli.command.is_none());
         assert!(cli.run.db_url.is_none());
+    }
+
+    #[test]
+    fn parse_port_binding_range_accepts_in_order_range() {
+        assert_eq!(
+            super::parse_port_binding_range("18000-19999").unwrap(),
+            (18000, 19999)
+        );
+    }
+
+    #[test]
+    fn parse_port_binding_range_accepts_single_port_range() {
+        assert_eq!(
+            super::parse_port_binding_range("18765-18765").unwrap(),
+            (18765, 18765)
+        );
+    }
+
+    #[test]
+    fn parse_port_binding_range_rejects_missing_separator() {
+        let err = super::parse_port_binding_range("18000").unwrap_err();
+        assert!(err.contains("`<start>-<end>`"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_port_binding_range_rejects_non_numeric_start() {
+        let err = super::parse_port_binding_range("abc-19000").unwrap_err();
+        assert!(err.contains("invalid start port"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_port_binding_range_rejects_non_numeric_end() {
+        let err = super::parse_port_binding_range("18000-xyz").unwrap_err();
+        assert!(err.contains("invalid end port"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_port_binding_range_rejects_zero_start() {
+        let err = super::parse_port_binding_range("0-19000").unwrap_err();
+        assert!(err.contains("not a valid TCP port"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_port_binding_range_rejects_zero_end() {
+        let err = super::parse_port_binding_range("18000-0").unwrap_err();
+        assert!(err.contains("not a valid TCP port"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_port_binding_range_rejects_inverted_range() {
+        let err = super::parse_port_binding_range("20000-18000").unwrap_err();
+        assert!(err.contains("must be <= end"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_port_binding_range_rejects_overflow_end() {
+        // 70000 doesn't fit in u16; parse_port_binding_range should surface
+        // the underlying ParseIntError via the "invalid end port" prefix.
+        let err = super::parse_port_binding_range("18000-70000").unwrap_err();
+        assert!(err.contains("invalid end port"), "got: {err}");
     }
 }

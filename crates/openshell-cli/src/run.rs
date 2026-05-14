@@ -37,7 +37,8 @@ use openshell_core::proto::{
     ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, Provider, ProviderProfile,
     ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
-    RevokeSshSessionRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
+    BindMount, PortBinding, RevokeSshSessionRequest, Sandbox, SandboxPhase, SandboxPolicy,
+    SandboxSpec, SandboxTemplate,
     ServiceEndpointResponse, SetClusterInferenceRequest, SettingScope, SettingValue,
     TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, UpdateProviderRequest,
     WatchSandboxRequest, exec_sandbox_event, setting_value, tcp_forward_init,
@@ -1457,6 +1458,95 @@ async fn finalize_sandbox_create_session(
     session_result
 }
 
+/// Parse a `--port-binding HOST_PORT:CONTAINER_PORT` flag value.
+///
+/// Returns a `PortBinding` ready to attach to a `SandboxTemplate`. The
+/// gateway driver performs the final allow-list enforcement; this parser
+/// only normalizes the surface format and rejects values that obviously
+/// cannot represent a TCP port.
+pub fn parse_port_binding(spec: &str) -> Result<PortBinding> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    if parts.len() != 2 {
+        return Err(miette::miette!(
+            "invalid --port-binding '{}': expected 'HOST_PORT:CONTAINER_PORT'",
+            spec
+        ));
+    }
+    let host_port: u32 = parts[0].parse().map_err(|_| {
+        miette::miette!(
+            "invalid --port-binding '{}': host_port '{}' is not a number",
+            spec,
+            parts[0]
+        )
+    })?;
+    let container_port: u32 = parts[1].parse().map_err(|_| {
+        miette::miette!(
+            "invalid --port-binding '{}': container_port '{}' is not a number",
+            spec,
+            parts[1]
+        )
+    })?;
+    if host_port == 0 || host_port > 65_535 || container_port == 0 || container_port > 65_535 {
+        return Err(miette::miette!(
+            "invalid --port-binding '{}': ports must be in (0, 65535]",
+            spec
+        ));
+    }
+    Ok(PortBinding {
+        container_port,
+        host_port,
+    })
+}
+
+/// Parse a `--bind-mount HOST_PATH:CONTAINER_PATH[:ro|:rw]` flag value.
+///
+/// Defaults to read-only when the mode suffix is omitted. The driver
+/// canonicalizes the host path and applies allow/deny lists; this parser
+/// only validates the surface format and rejects clearly malformed inputs.
+pub fn parse_bind_mount(spec: &str) -> Result<BindMount> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    let (host_path, container_path, read_only) = match parts.len() {
+        2 => (parts[0], parts[1], None),
+        3 => {
+            let mode = match parts[2] {
+                "ro" => Some(true),
+                "rw" => Some(false),
+                other => {
+                    return Err(miette::miette!(
+                        "invalid --bind-mount '{}': mode '{}' must be 'ro' or 'rw'",
+                        spec,
+                        other
+                    ));
+                }
+            };
+            (parts[0], parts[1], mode)
+        }
+        _ => {
+            return Err(miette::miette!(
+                "invalid --bind-mount '{}': expected 'HOST_PATH:CONTAINER_PATH[:ro|:rw]'",
+                spec
+            ));
+        }
+    };
+    if host_path.is_empty() || container_path.is_empty() {
+        return Err(miette::miette!(
+            "invalid --bind-mount '{}': paths must not be empty",
+            spec
+        ));
+    }
+    if !host_path.starts_with('/') || !container_path.starts_with('/') {
+        return Err(miette::miette!(
+            "invalid --bind-mount '{}': paths must be absolute",
+            spec
+        ));
+    }
+    Ok(BindMount {
+        host_path: host_path.to_string(),
+        container_path: container_path.to_string(),
+        read_only,
+    })
+}
+
 /// Create a sandbox with default settings.
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)] // user-facing CLI command; default hasher is fine
 pub async fn sandbox_create(
@@ -1476,6 +1566,8 @@ pub async fn sandbox_create(
     tty_override: Option<bool>,
     auto_providers_override: Option<bool>,
     labels: &HashMap<String, String>,
+    port_bindings: &[PortBinding],
+    bind_mounts: &[BindMount],
     tls: &TlsOptions,
 ) -> Result<()> {
     if editor.is_some() && !command.is_empty() {
@@ -1533,6 +1625,8 @@ pub async fn sandbox_create(
 
     let template = image.map(|img| SandboxTemplate {
         image: img,
+        port_bindings: port_bindings.to_vec(),
+        bind_mounts: bind_mounts.to_vec(),
         ..SandboxTemplate::default()
     });
 
@@ -6016,8 +6110,9 @@ mod tests {
         format_provider_attachment_table, gateway_add, gateway_auth_label,
         gateway_env_override_warning, gateway_select_with, gateway_type_label, git_sync_files,
         http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
-        inferred_provider_type, package_managed_tls_dirs, parse_cli_setting_value,
-        parse_credential_pairs, plaintext_gateway_is_remote, provisioning_timeout_message,
+        inferred_provider_type, package_managed_tls_dirs, parse_bind_mount,
+        parse_cli_setting_value, parse_credential_pairs, parse_port_binding,
+        plaintext_gateway_is_remote, provisioning_timeout_message,
         ready_false_condition_message, resolve_from, sandbox_should_persist,
         service_expose_status_error, service_url_for_gateway,
     };
@@ -6917,5 +7012,163 @@ mod tests {
             format_endpoint(&l7_scoped),
             "host.example.test:443 [L7 rest, allow PUT /v1/example/resource, deny DELETE /v1/example/resource]"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // parse_port_binding — surface format only.  Driver does the final
+    // allow-list / range enforcement; these tests pin the parser's own
+    // contract so a refactor of `split(':')` etc. surfaces immediately.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_port_binding_happy_case() {
+        let pb = parse_port_binding("18000:8000").unwrap();
+        assert_eq!(pb.host_port, 18000);
+        assert_eq!(pb.container_port, 8000);
+    }
+
+    #[test]
+    fn parse_port_binding_rejects_missing_separator() {
+        let err = parse_port_binding("18000").unwrap_err();
+        assert!(
+            err.to_string().contains("HOST_PORT:CONTAINER_PORT"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_port_binding_rejects_three_segments() {
+        let err = parse_port_binding("18000:8000:foo").unwrap_err();
+        assert!(
+            err.to_string().contains("HOST_PORT:CONTAINER_PORT"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_port_binding_rejects_non_numeric_host() {
+        let err = parse_port_binding("abc:8000").unwrap_err();
+        assert!(
+            err.to_string().contains("host_port") && err.to_string().contains("not a number"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_port_binding_rejects_non_numeric_container() {
+        let err = parse_port_binding("18000:xyz").unwrap_err();
+        assert!(
+            err.to_string().contains("container_port")
+                && err.to_string().contains("not a number"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_port_binding_rejects_zero_host_port() {
+        let err = parse_port_binding("0:8000").unwrap_err();
+        assert!(err.to_string().contains("(0, 65535]"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_port_binding_rejects_zero_container_port() {
+        let err = parse_port_binding("18000:0").unwrap_err();
+        assert!(err.to_string().contains("(0, 65535]"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_port_binding_rejects_host_port_above_u16() {
+        let err = parse_port_binding("70000:8000").unwrap_err();
+        assert!(err.to_string().contains("(0, 65535]"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_port_binding_rejects_container_port_above_u16() {
+        let err = parse_port_binding("18000:70000").unwrap_err();
+        assert!(err.to_string().contains("(0, 65535]"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // parse_bind_mount — surface format only.  Driver applies
+    // canonicalize + deny/allow lists; these tests pin the parser
+    // grammar (segment count, mode keyword, empty/relative path
+    // guards) so a refactor doesn't silently widen the API.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_bind_mount_two_segments_defaults_to_implicit_ro() {
+        // The parser leaves `read_only = None` for the two-segment form;
+        // the driver substitutes `true` (ro) at apply time.  Encoding the
+        // distinction here keeps the "default = ro" decision in the
+        // driver (a security choice) rather than in the CLI string.
+        let bm = parse_bind_mount("/host:/cont").unwrap();
+        assert_eq!(bm.host_path, "/host");
+        assert_eq!(bm.container_path, "/cont");
+        assert_eq!(bm.read_only, None);
+    }
+
+    #[test]
+    fn parse_bind_mount_explicit_ro_sets_some_true() {
+        let bm = parse_bind_mount("/host:/cont:ro").unwrap();
+        assert_eq!(bm.read_only, Some(true));
+    }
+
+    #[test]
+    fn parse_bind_mount_explicit_rw_sets_some_false() {
+        let bm = parse_bind_mount("/host:/cont:rw").unwrap();
+        assert_eq!(bm.read_only, Some(false));
+    }
+
+    #[test]
+    fn parse_bind_mount_rejects_invalid_mode() {
+        let err = parse_bind_mount("/host:/cont:weird").unwrap_err();
+        assert!(
+            err.to_string().contains("mode") && err.to_string().contains("'ro' or 'rw'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_bind_mount_rejects_single_segment() {
+        let err = parse_bind_mount("/host").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("HOST_PATH:CONTAINER_PATH[:ro|:rw]"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_bind_mount_rejects_four_segments() {
+        let err = parse_bind_mount("/host:/cont:ro:extra").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("HOST_PATH:CONTAINER_PATH[:ro|:rw]"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_bind_mount_rejects_empty_host_path() {
+        let err = parse_bind_mount(":/cont").unwrap_err();
+        assert!(err.to_string().contains("must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_bind_mount_rejects_empty_container_path() {
+        let err = parse_bind_mount("/host:").unwrap_err();
+        assert!(err.to_string().contains("must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_bind_mount_rejects_relative_host_path() {
+        let err = parse_bind_mount("host:/cont").unwrap_err();
+        assert!(err.to_string().contains("absolute"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_bind_mount_rejects_relative_container_path() {
+        let err = parse_bind_mount("/host:cont").unwrap_err();
+        assert!(err.to_string().contains("absolute"), "got: {err}");
     }
 }

@@ -16,16 +16,16 @@ use crate::supervisor_session::SupervisorSessionRegistry;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
-    CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
-    DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
-    DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest, ListSandboxesRequest,
-    ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
-    watch_sandboxes_event,
+    BindMount as DriverBindMount, CreateSandboxRequest, DeleteSandboxRequest, DriverCondition,
+    DriverPlatformEvent, DriverResourceRequirements, DriverSandbox, DriverSandboxSpec,
+    DriverSandboxStatus, DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest,
+    ListSandboxesRequest, PortBinding as DriverPortBinding, ValidateSandboxCreateRequest,
+    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
+    compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto::{
-    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
-    SandboxTemplate, SshSession,
+    BindMount, PlatformEvent, PortBinding, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec,
+    SandboxStatus, SandboxTemplate, SshSession,
 };
 use openshell_driver_docker::DockerComputeDriver;
 use openshell_driver_kubernetes::{
@@ -1143,6 +1143,36 @@ fn driver_sandbox_template_from_public(template: &SandboxTemplate) -> DriverSand
         environment: template.environment.clone(),
         resources: extract_typed_resources(&template.resources),
         platform_config: build_platform_config(template),
+        port_bindings: template
+            .port_bindings
+            .iter()
+            .map(driver_port_binding_from_public)
+            .collect(),
+        bind_mounts: template
+            .bind_mounts
+            .iter()
+            .map(driver_bind_mount_from_public)
+            .collect(),
+    }
+}
+
+/// Public → driver-internal mirror for `PortBinding`. Field-for-field copy:
+/// the driver enforces semantics (allowed range, dedup, 127.0.0.1 binding);
+/// the gateway only translates the wire shape across the package boundary.
+fn driver_port_binding_from_public(pb: &PortBinding) -> DriverPortBinding {
+    DriverPortBinding {
+        container_port: pb.container_port,
+        host_port: pb.host_port,
+    }
+}
+
+/// Public → driver-internal mirror for `BindMount`. Field-for-field copy;
+/// the driver canonicalizes the host path and applies the allow/deny lists.
+fn driver_bind_mount_from_public(bm: &BindMount) -> DriverBindMount {
+    DriverBindMount {
+        host_path: bm.host_path.clone(),
+        container_path: bm.container_path.clone(),
+        read_only: bm.read_only,
     }
 }
 
@@ -2756,5 +2786,69 @@ mod tests {
             config.is_none() || !config.as_ref().unwrap().fields.contains_key("host_users"),
             "unset user_namespaces must not produce host_users"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Public → driver mirror transfer.
+    //
+    // `driver_sandbox_template_from_public` is a trivial field-copy but
+    // it's the SINGLE wire bridge between the public proto package and
+    // the driver-internal package.  A future proto field added on one
+    // side that isn't wired here would silently drop on the request
+    // path.  This regression test pins the contract for the two fields
+    // we just added; future fields should grow this test in lockstep.
+    // ------------------------------------------------------------------
+    #[test]
+    fn template_passthrough_preserves_port_bindings_and_bind_mounts() {
+        let public = SandboxTemplate {
+            image: "img".to_string(),
+            port_bindings: vec![
+                PortBinding {
+                    container_port: 8000,
+                    host_port: 18000,
+                },
+                PortBinding {
+                    container_port: 9000,
+                    host_port: 19000,
+                },
+            ],
+            bind_mounts: vec![
+                BindMount {
+                    host_path: "/host/a".to_string(),
+                    container_path: "/cont/a".to_string(),
+                    read_only: Some(false),
+                },
+                BindMount {
+                    host_path: "/host/b".to_string(),
+                    container_path: "/cont/b".to_string(),
+                    read_only: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let driver = driver_sandbox_template_from_public(&public);
+        assert_eq!(driver.port_bindings.len(), 2);
+        assert_eq!(driver.port_bindings[0].host_port, 18000);
+        assert_eq!(driver.port_bindings[0].container_port, 8000);
+        assert_eq!(driver.port_bindings[1].host_port, 19000);
+        assert_eq!(driver.port_bindings[1].container_port, 9000);
+        assert_eq!(driver.bind_mounts.len(), 2);
+        assert_eq!(driver.bind_mounts[0].host_path, "/host/a");
+        assert_eq!(driver.bind_mounts[0].container_path, "/cont/a");
+        assert_eq!(driver.bind_mounts[0].read_only, Some(false));
+        assert_eq!(driver.bind_mounts[1].host_path, "/host/b");
+        assert_eq!(driver.bind_mounts[1].container_path, "/cont/b");
+        assert_eq!(driver.bind_mounts[1].read_only, None);
+    }
+
+    #[test]
+    fn template_passthrough_empty_when_public_lists_are_empty() {
+        let public = SandboxTemplate {
+            image: "img".to_string(),
+            ..Default::default()
+        };
+        let driver = driver_sandbox_template_from_public(&public);
+        assert!(driver.port_bindings.is_empty());
+        assert!(driver.bind_mounts.is_empty());
     }
 }
