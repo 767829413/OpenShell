@@ -449,6 +449,10 @@ fn managed_container_label_filters_include_gateway_namespace() {
 fn build_container_create_body_clears_inherited_cmd() {
     let create_body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
 
+    // Regression: when no port_bindings are requested, exposed_ports
+    // must stay None (matches default behaviour pre-port-binding work).
+    assert_eq!(create_body.exposed_ports, None);
+
     assert_eq!(
         create_body.entrypoint,
         Some(vec![SUPERVISOR_MOUNT_PATH.to_string()])
@@ -1033,6 +1037,53 @@ fn port_bindings_rejected_when_driver_has_no_allowed_range() {
     let err = enforce_and_build_port_bindings(&template, &cfg).unwrap_err();
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
     assert!(err.message().contains("disabled"), "msg: {}", err.message());
+}
+
+#[test]
+fn build_container_create_body_sets_exposed_ports_for_port_bindings() {
+    // M6 e2e finding: `HostConfig.PortBindings` alone is not enough.
+    // Without a matching entry in `Config.ExposedPorts`, dockerd silently
+    // drops the binding (no DNAT, no error, no log line). This regression
+    // covers the contract that `build_container_create_body` keeps the
+    // two surfaces in lock-step.
+    let mut sandbox = test_sandbox();
+    if let Some(spec) = sandbox.spec.as_mut() {
+        if let Some(template) = spec.template.as_mut() {
+            template.port_bindings = vec![
+                ProtoPortBinding {
+                    container_port: 8000,
+                    host_port: 18000,
+                },
+                ProtoPortBinding {
+                    container_port: 9090,
+                    host_port: 19090,
+                },
+            ];
+        }
+    }
+    let mut cfg = runtime_config();
+    cfg.port_binding_allowed_range = Some((18000, 19999));
+
+    let body = build_container_create_body(&sandbox, &cfg).unwrap();
+    let exposed = body
+        .exposed_ports
+        .expect("exposed_ports must be Some when port_bindings is non-empty");
+    let mut sorted = exposed.clone();
+    sorted.sort();
+    assert_eq!(sorted, vec!["8000/tcp".to_string(), "9090/tcp".to_string()]);
+
+    // Cross-check: HostConfig.PortBindings keys must match ExposedPorts entries.
+    let host_pb = body
+        .host_config
+        .as_ref()
+        .and_then(|hc| hc.port_bindings.as_ref())
+        .expect("host_config.port_bindings must be Some");
+    for proto_port in &sorted {
+        assert!(
+            host_pb.contains_key(proto_port),
+            "port {proto_port} present in exposed_ports must also be a HostConfig.PortBindings key"
+        );
+    }
 }
 
 #[test]

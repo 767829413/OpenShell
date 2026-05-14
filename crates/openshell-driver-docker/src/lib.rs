@@ -1263,6 +1263,25 @@ fn build_container_create_body(
     let mut binds = build_binds(config);
     binds.extend(user_bind_mounts);
 
+    // ExposedPorts must mirror every container port we're publishing in
+    // HostConfig.PortBindings. Without this, dockerd silently DROPS the
+    // PortBindings entries — no DNAT rule, no host listener, and (worst
+    // of all) no error or log line at create time. The container starts
+    // happily, the port appears bound inside, and host curl gets
+    // ECONNREFUSED with no breadcrumbs. Mirror the set here so the two
+    // surfaces of the same fact can never drift apart.
+    let exposed_ports = if template.port_bindings.is_empty() {
+        None
+    } else {
+        Some(
+            template
+                .port_bindings
+                .iter()
+                .map(|pb| format!("{}/tcp", pb.container_port))
+                .collect::<Vec<String>>(),
+        )
+    };
+
     Ok(ContainerCreateBody {
         image: Some(template.image.clone()),
         user: Some("0".to_string()),
@@ -1272,6 +1291,7 @@ fn build_container_create_body(
         // supervisor entrypoint.
         cmd: Some(Vec::new()),
         labels: Some(labels),
+        exposed_ports,
         host_config: Some(HostConfig {
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
