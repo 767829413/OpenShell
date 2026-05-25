@@ -4,10 +4,10 @@
 use openshell_cli::tls::{TlsOptions, grpc_client};
 use openshell_core::proto::{
     CreateProviderRequest, CreateSshSessionRequest, CreateSshSessionResponse,
-    DeleteProviderRequest, DeleteProviderResponse, ExecSandboxEvent, ExecSandboxRequest,
-    GetProviderRequest, HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, ServiceStatus,
-    UpdateProviderRequest,
+    DeleteProviderRequest, DeleteProviderResponse, ExecSandboxEvent, ExecSandboxInput,
+    ExecSandboxRequest, GetProviderRequest, HealthRequest, HealthResponse, ListProvidersRequest,
+    ListProvidersResponse, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    ServiceStatus, UpdateProviderRequest,
     open_shell_server::{OpenShell, OpenShellServer},
 };
 use rcgen::{
@@ -277,6 +277,33 @@ impl OpenShell for TestOpenShell {
             "update_provider not implemented in test",
         ))
     }
+    async fn get_provider_refresh_status(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetProviderRefreshStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderRefreshStatusResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn configure_provider_refresh(
+        &self,
+        _: tonic::Request<openshell_core::proto::ConfigureProviderRefreshRequest>,
+    ) -> Result<Response<openshell_core::proto::ConfigureProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn rotate_provider_credential(
+        &self,
+        _: tonic::Request<openshell_core::proto::RotateProviderCredentialRequest>,
+    ) -> Result<Response<openshell_core::proto::RotateProviderCredentialResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_provider_refresh(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteProviderRefreshRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
 
     async fn delete_provider(
         &self,
@@ -314,6 +341,15 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
+    }
+
+    type ExecSandboxInteractiveStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
+    async fn exec_sandbox_interactive(
+        &self,
+        _request: tonic::Request<tonic::Streaming<ExecSandboxInput>>,
+    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     async fn update_config(
@@ -418,6 +454,20 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::GetDraftHistoryRequest>,
     ) -> Result<Response<openshell_core::proto::GetDraftHistoryResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn issue_sandbox_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::IssueSandboxTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::IssueSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn refresh_sandbox_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RefreshSandboxTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::RefreshSandboxTokenResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 

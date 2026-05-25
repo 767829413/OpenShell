@@ -521,6 +521,8 @@ fn policy_chunk_from_add_rule(
         first_seen_ms: 0,
         last_seen_ms: 0,
         binary,
+        validation_result: String::new(),
+        rejection_reason: String::new(),
     })
 }
 
